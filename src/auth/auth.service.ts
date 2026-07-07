@@ -30,6 +30,11 @@ interface AppleUserInfo {
   email?: string;
 }
 
+// refresh token 잔여 수명이 이 값 미만일 때만 새 refresh token 으로 회전한다.
+// 매 refresh 마다 회전하면 응답 유실(타임아웃/앱 종료) 시 클라이언트는 옛 토큰,
+// DB 는 새 해시가 되어 다음 refresh 가 401 로 끊기는 race 가 있다.
+const REFRESH_ROTATE_THRESHOLD_MS = 3 * 24 * 60 * 60 * 1000; // 3일
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -275,7 +280,7 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string) {
-    let payload: { sub: string };
+    let payload: { sub: string; exp: number };
     try {
       payload = await this.jwt.verifyAsync(refreshToken, {
         secret: this.refreshSecret,
@@ -298,8 +303,20 @@ export class AuthService {
     }
 
     const { refreshToken: _rt, ...publicUser } = user;
-    const tokens = await this.issueTokens(publicUser.id);
-    return { ...tokens, user: publicUser };
+
+    // 만료 임박 시에만 회전 — 평소에는 기존 refresh token 을 그대로 돌려줘
+    // 응답 유실 시에도 클라이언트가 들고 있는 토큰이 계속 유효하도록 한다.
+    const msLeft = payload.exp * 1000 - Date.now();
+    if (msLeft < REFRESH_ROTATE_THRESHOLD_MS) {
+      const tokens = await this.issueTokens(publicUser.id);
+      return { ...tokens, user: publicUser };
+    }
+
+    const accessToken = await this.jwt.signAsync(
+      { sub: publicUser.id },
+      { secret: this.accessSecret, expiresIn: '15m' },
+    );
+    return { accessToken, refreshToken, user: publicUser };
   }
 
   async logout(userId: string) {
